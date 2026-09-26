@@ -44,18 +44,22 @@ static const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
 // ============================================================
 // IR SENSOR / MOTOR CONFIG
 // ============================================================
-// QUAN TRỌNG: project hiện tại không cung cấp GPIO thật của cảm biến/motor,
-// vì vậy mặc định để -1 để firmware vẫn compile an toàn nhưng KHÔNG đọc sensor
-// và KHÔNG chạy motor cho tới khi bạn điền đúng chân phần cứng.
 //
 // IR2 = cảm biến biên trái
 // IR3 = cảm biến biên phải
 // IR5 = cảm biến phát hiện món trên robot
-static const int IR2_PIN = -1;
-static const int IR3_PIN = -1;
-static const int IR5_PIN = -1;
+//
+// QUY ƯỚC MQTT GIỮ ĐÚNG VỚI WEB:
+//   ir2=true, ir3=true  -> đang ở nền đường / còn tín hiệu
+//   ir2=false           -> cảm biến trái chạm băng đen
+//   ir3=false           -> cảm biến phải chạm băng đen
+//
+// Vì module IR thường xuất LOW khi gặp băng đen nên IR2/IR3_ACTIVE_LOW=true.
+// IR5 vẫn dùng true = phát hiện món.
+static const int IR2_PIN = 32;
+static const int IR3_PIN = 33;
+static const int IR5_PIN = 34;
 
-// Nếu module IR xuất LOW khi phát hiện vật/vạch thì để true.
 static const bool IR2_ACTIVE_LOW = true;
 static const bool IR3_ACTIVE_LOW = true;
 static const bool IR5_ACTIVE_LOW = true;
@@ -66,21 +70,46 @@ static const unsigned long SENSOR_PUBLISH_INTERVAL_MS = 50;
 // Motor watchdog: quá thời gian này không nhận lệnh mới từ frontend -> STOP.
 static const unsigned long MOTOR_WATCHDOG_MS = 350;
 
-// Generic H-bridge: mỗi motor dùng IN1, IN2, PWM.
-// Điền đúng GPIO theo driver thực tế rồi đổi MOTOR_DRIVER_ENABLED = true.
-static const bool MOTOR_DRIVER_ENABLED = false;
+// ============================================================
+// 4 MOTOR / 2 DRIVER L298H/L298N
+// ============================================================
+// Driver #1 điều khiển 2 motor bên TRÁI.
+// Driver #2 điều khiển 2 motor bên PHẢI.
+//
+// Mỗi kênh dùng 3 chân: IN1, IN2, PWM(ENA/ENB).
+// Nếu board L298 đang cắm jumper ENA/ENB thì tháo jumper để ESP32 PWM được.
+//
+// Các GPIO dưới đây giữ 6 chân cũ cho motor A và bổ sung 6 chân cho motor B.
+// Hãy đổi đúng theo dây thực tế nếu phần cứng của bạn khác.
+static const bool MOTOR_DRIVER_ENABLED = true;
 
-static const int LEFT_MOTOR_IN1  = -1;
-static const int LEFT_MOTOR_IN2  = -1;
-static const int LEFT_MOTOR_PWM  = -1;
+// -------- L298 #1: 2 motor bên trái --------
+// Kênh A - motor trái trước
+static const int LEFT_FRONT_IN1 = 25;
+static const int LEFT_FRONT_IN2 = 26;
+static const int LEFT_FRONT_PWM = 27;
 
-static const int RIGHT_MOTOR_IN1 = -1;
-static const int RIGHT_MOTOR_IN2 = -1;
-static const int RIGHT_MOTOR_PWM = -1;
+// Kênh B - motor trái sau
+static const int LEFT_REAR_IN1 = 13;
+static const int LEFT_REAR_IN2 = 14;
+static const int LEFT_REAR_PWM = 16;
 
-// Nếu motor quay ngược chiều mong muốn thì đổi true/false cho từng bên.
-static const bool LEFT_MOTOR_REVERSED = false;
-static const bool RIGHT_MOTOR_REVERSED = false;
+// -------- L298 #2: 2 motor bên phải --------
+// Kênh A - motor phải trước
+static const int RIGHT_FRONT_IN1 = 18;
+static const int RIGHT_FRONT_IN2 = 19;
+static const int RIGHT_FRONT_PWM = 23;
+
+// Kênh B - motor phải sau
+static const int RIGHT_REAR_IN1 = 17;
+static const int RIGHT_REAR_IN2 = 21;
+static const int RIGHT_REAR_PWM = 22;
+
+// Nếu riêng motor nào quay ngược, chỉ đổi cờ tương ứng thành true.
+static const bool LEFT_FRONT_REVERSED = true;
+static const bool LEFT_REAR_REVERSED = false;
+static const bool RIGHT_FRONT_REVERSED = false;
+static const bool RIGHT_REAR_REVERSED = true;
 
 // ============================================================
 // GLOBAL
@@ -102,9 +131,11 @@ unsigned long lastMqttReconnectAttemptMs = 0;
 bool lastWifiConnectedForMqtt = false;
 bool mqttConfigWarningPrinted = false;
 
-// Realtime sensor state
-bool ir2Detected = false;
-bool ir3Detected = false;
+// Realtime sensor state.
+// IR2/IR3 mặc định true để đúng quy ước: chưa chạm băng đen.
+// IR5 mặc định false để không tự coi là đã có món khi vừa boot.
+bool ir2Signal = true;
+bool ir3Signal = true;
 bool ir5Detected = false;
 bool hasFood = false;
 unsigned long lastSensorPublishMs = 0;
@@ -951,6 +982,24 @@ String robotMotorTopic() {
   return String("topic") + String(robotNumber()) + "/motor";
 }
 
+// IR2/IR3: giá trị publish ra web là "signal còn tốt".
+// true  = nền đường / chưa chạm băng đen.
+// false = phát hiện băng đen.
+bool readLineSensorSignal(int pin, bool detectionActiveLow) {
+  if (pin < 0) {
+    // Nếu chưa gắn GPIO thì giữ mặc định an toàn theo yêu cầu của web.
+    return true;
+  }
+
+  int raw = digitalRead(pin);
+  bool blackDetected = detectionActiveLow
+    ? (raw == LOW)
+    : (raw == HIGH);
+
+  return !blackDetected;
+}
+
+// IR5: true = phát hiện món.
 bool readIrDetected(int pin, bool activeLow) {
   if (pin < 0) {
     return false;
@@ -960,32 +1009,64 @@ bool readIrDetected(int pin, bool activeLow) {
   return activeLow ? (raw == LOW) : (raw == HIGH);
 }
 
+bool motorChannelReady(int in1, int in2, int pwmPin) {
+  return in1 >= 0 && in2 >= 0 && pwmPin >= 0;
+}
+
+void setupOneMotorChannel(int in1, int in2, int pwmPin) {
+  if (!motorChannelReady(in1, in2, pwmPin)) {
+    return;
+  }
+
+  pinMode(in1, OUTPUT);
+  pinMode(in2, OUTPUT);
+  pinMode(pwmPin, OUTPUT);
+
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  analogWrite(pwmPin, 0);
+}
+
 void setupRealtimeHardware() {
   if (IR2_PIN >= 0) pinMode(IR2_PIN, INPUT);
   if (IR3_PIN >= 0) pinMode(IR3_PIN, INPUT);
   if (IR5_PIN >= 0) pinMode(IR5_PIN, INPUT);
 
-  if (
-    MOTOR_DRIVER_ENABLED &&
-    LEFT_MOTOR_IN1 >= 0 && LEFT_MOTOR_IN2 >= 0 && LEFT_MOTOR_PWM >= 0 &&
-    RIGHT_MOTOR_IN1 >= 0 && RIGHT_MOTOR_IN2 >= 0 && RIGHT_MOTOR_PWM >= 0
-  ) {
-    pinMode(LEFT_MOTOR_IN1, OUTPUT);
-    pinMode(LEFT_MOTOR_IN2, OUTPUT);
-    pinMode(LEFT_MOTOR_PWM, OUTPUT);
+  if (MOTOR_DRIVER_ENABLED) {
+    setupOneMotorChannel(
+      LEFT_FRONT_IN1,
+      LEFT_FRONT_IN2,
+      LEFT_FRONT_PWM
+    );
 
-    pinMode(RIGHT_MOTOR_IN1, OUTPUT);
-    pinMode(RIGHT_MOTOR_IN2, OUTPUT);
-    pinMode(RIGHT_MOTOR_PWM, OUTPUT);
+    setupOneMotorChannel(
+      LEFT_REAR_IN1,
+      LEFT_REAR_IN2,
+      LEFT_REAR_PWM
+    );
 
-    Serial.println("[MOTOR] Generic H-bridge enabled");
+    setupOneMotorChannel(
+      RIGHT_FRONT_IN1,
+      RIGHT_FRONT_IN2,
+      RIGHT_FRONT_PWM
+    );
+
+    setupOneMotorChannel(
+      RIGHT_REAR_IN1,
+      RIGHT_REAR_IN2,
+      RIGHT_REAR_PWM
+    );
+
+    Serial.println(
+      "[MOTOR] 4 motors / 2 L298 enabled: L298#1=LEFT, L298#2=RIGHT"
+    );
   } else {
-    Serial.println("[MOTOR] Disabled - hay dien GPIO va MOTOR_DRIVER_ENABLED=true");
+    Serial.println("[MOTOR] Disabled - MOTOR_DRIVER_ENABLED=false");
   }
 
-  if (IR2_PIN < 0 || IR3_PIN < 0 || IR5_PIN < 0) {
-    Serial.println("[SENSOR] IR GPIO chua duoc cau hinh; mac dinh se doc false");
-  }
+  Serial.println(
+    "[SENSOR] IR2/IR3 MQTT convention: true=road, false=black line"
+  );
 }
 
 void applyOneMotor(
@@ -995,12 +1076,14 @@ void applyOneMotor(
   int speedValue,
   bool reversed
 ) {
-  if (in1 < 0 || in2 < 0 || pwmPin < 0) {
+  if (!motorChannelReady(in1, in2, pwmPin)) {
     return;
   }
 
   int speed = constrain(speedValue, -255, 255);
-  if (reversed) speed = -speed;
+  if (reversed) {
+    speed = -speed;
+  }
 
   if (speed > 0) {
     digitalWrite(in1, HIGH);
@@ -1027,20 +1110,38 @@ void applyMotorSpeeds(int left, int right) {
     return;
   }
 
+  // L298 #1: cả 2 motor bên trái nhận cùng lệnh LEFT.
   applyOneMotor(
-    LEFT_MOTOR_IN1,
-    LEFT_MOTOR_IN2,
-    LEFT_MOTOR_PWM,
+    LEFT_FRONT_IN1,
+    LEFT_FRONT_IN2,
+    LEFT_FRONT_PWM,
     currentLeftMotor,
-    LEFT_MOTOR_REVERSED
+    LEFT_FRONT_REVERSED
   );
 
   applyOneMotor(
-    RIGHT_MOTOR_IN1,
-    RIGHT_MOTOR_IN2,
-    RIGHT_MOTOR_PWM,
+    LEFT_REAR_IN1,
+    LEFT_REAR_IN2,
+    LEFT_REAR_PWM,
+    currentLeftMotor,
+    LEFT_REAR_REVERSED
+  );
+
+  // L298 #2: cả 2 motor bên phải nhận cùng lệnh RIGHT.
+  applyOneMotor(
+    RIGHT_FRONT_IN1,
+    RIGHT_FRONT_IN2,
+    RIGHT_FRONT_PWM,
     currentRightMotor,
-    RIGHT_MOTOR_REVERSED
+    RIGHT_FRONT_REVERSED
+  );
+
+  applyOneMotor(
+    RIGHT_REAR_IN1,
+    RIGHT_REAR_IN2,
+    RIGHT_REAR_PWM,
+    currentRightMotor,
+    RIGHT_REAR_REVERSED
   );
 }
 
@@ -1079,8 +1180,8 @@ bool publishSensors() {
   String payload = "{";
   payload += "\"type\":\"sensors\",";
   payload += "\"robot\":" + String(robotNumber()) + ",";
-  payload += "\"ir2\":" + String(ir2Detected ? "true" : "false") + ",";
-  payload += "\"ir3\":" + String(ir3Detected ? "true" : "false") + ",";
+  payload += "\"ir2\":" + String(ir2Signal ? "true" : "false") + ",";
+  payload += "\"ir3\":" + String(ir3Signal ? "true" : "false") + ",";
   payload += "\"ir5\":" + String(ir5Detected ? "true" : "false") + ",";
   payload += "\"has_food\":" + String(hasFood ? "true" : "false") + ",";
   payload += "\"uptime_ms\":" + String(millis());
@@ -1508,17 +1609,20 @@ void serviceMqttHeartbeat() {
 }
 
 void serviceRealtimeSensorsAndMotor() {
-  bool nextIr2 = readIrDetected(IR2_PIN, IR2_ACTIVE_LOW);
-  bool nextIr3 = readIrDetected(IR3_PIN, IR3_ACTIVE_LOW);
+  // IR2/IR3: true = nền đường, false = chạm băng đen.
+  bool nextIr2 = readLineSensorSignal(IR2_PIN, IR2_ACTIVE_LOW);
+  bool nextIr3 = readLineSensorSignal(IR3_PIN, IR3_ACTIVE_LOW);
+
+  // IR5: true = có món.
   bool nextIr5 = readIrDetected(IR5_PIN, IR5_ACTIVE_LOW);
 
   bool changed =
-    nextIr2 != ir2Detected ||
-    nextIr3 != ir3Detected ||
+    nextIr2 != ir2Signal ||
+    nextIr3 != ir3Signal ||
     nextIr5 != ir5Detected;
 
-  ir2Detected = nextIr2;
-  ir3Detected = nextIr3;
+  ir2Signal = nextIr2;
+  ir3Signal = nextIr3;
   ir5Detected = nextIr5;
   hasFood = ir5Detected;
 
